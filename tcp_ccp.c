@@ -100,6 +100,22 @@ static u64 ccp_after(u64 us) {
     return timespec64_to_ns(&now);
 }
 
+//互斥访问。计算当前sock在所有subflow中的序号，序号从1开始，0记录的是当前sock。
+int get_sock_number(const struct sock *sk) {
+    struct mptcp_tcp_sock *mptcp;
+    struct mptcp_cb *mpcb;
+    int cnt；
+    const struct tcp_sock *tp = tcp_sk(sk);
+    mpcb = tp->mpcb;
+    cnt = 1;
+    mptcp_for_each_sub(mpcb, mptcp) { // 互斥访问。计算当前sock在所有subflow中的序号
+        if((void *)mptcp == (void *)sk) {
+            break;
+        }
+        cnt++;
+    }
+}
+
 // in dctcp code, in ack event used for ecn information per packet
 void tcp_ccp_in_ack_event(struct sock *sk, u32 flags) {
     // according to tcp_input, in_ack_event is called before cong_control, so mmt.ack has old ack value
@@ -107,6 +123,7 @@ void tcp_ccp_in_ack_event(struct sock *sk, u32 flags) {
     struct ccp *ca = inet_csk_ca(sk);
     struct ccp_primitives *mmt;
     u32 acked_bytes;
+    int n;
 #ifdef COMPAT_MODE
     int i=0;
     struct sk_buff *skb = tcp_write_queue_head(sk);
@@ -134,16 +151,17 @@ void tcp_ccp_in_ack_event(struct sock *sk, u32 flags) {
     }
 #endif
     
-    mmt = &ca->conn->prims;
+    mmt = &ca->conn->prims
+    n = get_sock_number(sk);
     acked_bytes = tp->snd_una - ca->last_snd_una;
     ca->last_snd_una = tp->snd_una;
     if (acked_bytes) {
         if (flags & CA_ACK_ECE) {
-            mmt->ecn_bytes = (u64)acked_bytes;
-            mmt->ecn_packets = (u64)acked_bytes / tp->mss_cache;
+            mmt->ecn_bytes[0] = mmt->ecn_bytes[n] = (u64)acked_bytes;
+            mmt->ecn_packets[0] = mmt->ecn_packets[n] = (u64)acked_bytes / tp->mss_cache;
         } else {
-            mmt->ecn_bytes = 0;
-            mmt->ecn_packets = 0;
+            mmt->ecn_bytes[0] = mmt->ecn_bytes[n] = 0;
+            mmt->ecn_packets[0] = mmt->ecn_packets[n] = 0;
         }
     }
 }
@@ -165,6 +183,7 @@ int load_primitives(struct sock *sk, const struct rate_sample *rs) {
     u64 ack_us = 0;
     u64 snd_us = 0;
     int measured_valid_rate = rate_sample_valid(rs);
+    int n;
     if ( measured_valid_rate != 0 ) {
         return -1;
     }
@@ -192,42 +211,43 @@ int load_primitives(struct sock *sk, const struct rate_sample *rs) {
         do_div(rout, ack_us);
     }
 
-    mmt->bytes_acked = tp->bytes_acked - ca->last_bytes_acked;
+    n = get_sock_number(sk);
+    mmt->bytes_acked[0] = mmt->bytes_acked[n] = tp->bytes_acked - ca->last_bytes_acked;
     ca->last_bytes_acked = tp->bytes_acked;
 
-    mmt->packets_misordered = tp->sacked_out - ca->last_sacked_out;
+    mmt->packets_misordered[0] = mmt->packets_misordered[n] = tp->sacked_out - ca->last_sacked_out;
     if (tp->sacked_out < ca->last_sacked_out) {
-        mmt->packets_misordered = 0;
+        mmt->packets_misordered[0] = mmt->packets_misordered[n] = 0;
     } else {
-        mmt->packets_misordered = tp->sacked_out - ca->last_sacked_out;
+        mmt->packets_misordered[0] = mmt->packets_misordered[n] = tp->sacked_out - ca->last_sacked_out;
     }
 
     ca->last_sacked_out = tp->sacked_out;
 
-    mmt->packets_acked = rs->acked_sacked - mmt->packets_misordered;
-    mmt->bytes_misordered = mmt->packets_misordered * tp->mss_cache;
-    mmt->lost_pkts_sample = rs->losses;
-    mmt->rtt_sample_us = rs->rtt_us;
+    mmt->packets_acked[0] = mmt->packets_acked[n] = rs->acked_sacked - mmt->packets_misordered;
+    mmt->bytes_misordered[0] = mmt->bytes_misordered[n] = mmt->packets_misordered[n] * tp->mss_cache;
+    mmt->lost_pkts_sample[0] = mmt->lost_pkts_sample[n] = rs->losses;
+    mmt->rtt_sample_us[0] = mmt->rtt_sample_us[n] = rs->rtt_us;
     if ( rin != 0 ) {
-        mmt->rate_outgoing = rin;
+        mmt->rate_outgoing[0] = mmt->rate_outgoing[n] = rin;
     }
 
     if ( rout != 0 ) {
-        mmt->rate_incoming = rout;
+        mmt->rate_incoming[0] = mmt->rate_incoming[n] = rout;
     }
 
-    mmt->bytes_in_flight = tcp_packets_in_flight(tp) * tp->mss_cache;
-    mmt->packets_in_flight = tcp_packets_in_flight(tp);
+    mmt->bytes_in_flight[0] = mmt->bytes_in_flight[n] = tcp_packets_in_flight(tp) * tp->mss_cache;
+    mmt->packets_in_flight[0] = mmt->packets_in_flight[n] = tcp_packets_in_flight(tp);
     if (tp->snd_cwnd <= 0) {
         return -1;
     }
 
-    mmt->snd_cwnd = tp->snd_cwnd * tp->mss_cache;
+    mmt->snd_cwnd[0] = mmt->snd-cwnd[n] = tp->snd_cwnd * tp->mss_cache;
 
     if (unlikely(tp->snd_una > tp->write_seq)) {
-        mmt->bytes_pending = ((u32) ~0U) - (tp->snd_una - tp->write_seq);
+        mmt->bytes_pending[0] = mmt->bytes_pending[n] = ((u32) ~0U) - (tp->snd_una - tp->write_seq);
     } else {
-        mmt->bytes_pending = (tp->write_seq - tp->snd_una);
+        mmt->bytes_pending[0] = mmt->bytes_pending[n] = (tp->write_seq - tp->snd_una);
     }
 
     return 0;
@@ -236,7 +256,7 @@ int load_primitives(struct sock *sk, const struct rate_sample *rs) {
 void tcp_ccp_cong_control(struct sock *sk, const struct rate_sample *rs) {
     // aggregate measurement
     // state = fold(state, rs)
-    int ok;
+    int ok, n;
     struct ccp *ca = inet_csk_ca(sk);
     struct ccp_connection *conn = ca->conn;
 
@@ -256,8 +276,8 @@ void tcp_ccp_cong_control(struct sock *sk, const struct rate_sample *rs) {
           pr_info("[ccp] libccp fallback timed out");
           // TODO default to cubic?
         }
-
-        ca->conn->prims.was_timeout = false;
+        n = get_sock_number(sk);
+        ca->conn->prims.was_timeout[0] = ca->conn->prims.was_timeout[n] = false;
     } else {
         pr_info("[ccp] ccp_connection not initialized");
     }
@@ -297,10 +317,12 @@ EXPORT_SYMBOL_GPL(tcp_ccp_pkts_acked);
  */
 void tcp_ccp_set_state(struct sock *sk, u8 new_state) {
     struct ccp *cpl = inet_csk_ca(sk);
+    int n;
+    n = get_sock_number(sk);
     switch (new_state) {
         case TCP_CA_Loss:
             if (cpl->conn != NULL) {
-                cpl->conn->prims.was_timeout = true;
+                cpl->conn->prims.was_timeout[0] = cpl->conn->prims.was_timeout[n] = true;
             }
             ccp_invoke(cpl->conn);
             return;
@@ -311,7 +333,7 @@ void tcp_ccp_set_state(struct sock *sk, u8 new_state) {
     }
             
     if (cpl->conn != NULL) {
-        cpl->conn->prims.was_timeout = false;
+        cpl->conn->prims.was_timeout[0] = cpl->conn->prims.was_timeout[n] = false;
     }
 }
 EXPORT_SYMBOL_GPL(tcp_ccp_set_state);
@@ -342,7 +364,12 @@ void tcp_ccp_init(struct sock *sk) {
     }
     memset(cpl->skb_array, 0, MAX_SKB_STORED * sizeof(struct skb_info));
 
-    cpl->conn = ccp_connection_start(kernel_datapath, (void *) sk, &dp_info);
+    const struct tcp_sock *meta_sk = tcp_sk(tp->meta_sock);
+    if (meta_sk == tp) {
+        cpl->conn = ccp_connection_start(kernel_datapath, (void *) sk, &dp_info);   
+    } else {
+        cpl->conn = struct ccp*(inet_csk_ca(meta_sk))->conn;
+    }
     if (cpl->conn == NULL) {
         pr_info("[ccp] start connection failed\n");
     } else {
@@ -360,7 +387,8 @@ EXPORT_SYMBOL_GPL(tcp_ccp_init);
 
 void tcp_ccp_release(struct sock *sk) {
     struct ccp *cpl = inet_csk_ca(sk);
-    if (cpl->conn != NULL) {
+    const struct tcp_sock *meta_sk = tcp_sk(tp->meta_sock);
+    if (cpl->conn != NULL && meta_sk == tcp_sk(sk)) {
         pr_info("[ccp] freeing connection %d", cpl->conn->index);
         ccp_connection_free(kernel_datapath, cpl->conn->index);
     } else {
