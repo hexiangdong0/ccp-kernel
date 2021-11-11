@@ -104,7 +104,7 @@ static u64 ccp_after(u64 us) {
 int get_sock_number(const struct sock *sk) {
     struct mptcp_tcp_sock *mptcp;
     struct mptcp_cb *mpcb;
-    int cnt；
+    int cnt;
     const struct tcp_sock *tp = tcp_sk(sk);
     mpcb = tp->mpcb;
     cnt = 1;
